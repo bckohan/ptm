@@ -8,7 +8,7 @@ from .. import __version__
 from ..config import initialize
 from . import bootstrap, check, generate, table
 
-app = Typer()
+app = Typer(pretty_exceptions_show_locals=False)
 
 app.add_typer(generate.app)
 app.add_typer(table.app)

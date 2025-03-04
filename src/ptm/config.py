@@ -2,6 +2,7 @@ import hashlib
 import itertools
 import os
 import shutil
+import sys
 import typing as t
 import warnings
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ from tomlkit.container import Container
 from tomlkit.items import String, Table
 
 from . import __version__ as ptm_version
+from .drivers import GenerationFailed
 
 
 class PTMDriver(t.Protocol):
@@ -104,7 +106,7 @@ class Dependency:
 
 @dataclass
 class Run:
-    python: Dependency
+    python: str
     dependencies: t.List[Dependency]
     group: "RunGroup"
 
@@ -161,7 +163,7 @@ class Run:
 
     @property
     def tags(self) -> t.List[str]:
-        return list(set(*self.group.env.tags, *self.group.tags))
+        return list(set((*self.group.env.tags, *self.group.tags)))
 
     @property
     def groups(self) -> t.List[str]:
@@ -188,7 +190,11 @@ class Run:
         self.env_file.write_text(
             "\n".join(f'{key}="{val}"' for key, val in self.setenv.items())
         )
-        self.group.env.cfg.driver.generate(self)
+        try:
+            self.group.env.cfg.driver.generate(self)
+        except GenerationFailed as gf:
+            print(gf)
+            sys.exit(1)
         return self
 
 
@@ -225,9 +231,7 @@ class RunGroup:
             try:
                 self.runs.append(
                     Run(
-                        python=Dependency.parse(
-                            "python", self.env.cfg.resolve_alias(run["python"])
-                        ),
+                        python=self.env.cfg.resolve_alias(run["python"]),
                         dependencies=[
                             Dependency.parse(pkg, self.env.cfg.resolve_alias(spec))
                             for pkg, spec in run.items()
@@ -256,9 +260,6 @@ class RunGroup:
 
     def generate(self, tags: t.Set[str] = {}) -> t.Generator[Run, None, None]:
         for run in self.runs:
-            import ipdb
-
-            ipdb.set_trace()
             if not tags or any((tag in tags for tag in run.tags)):
                 yield run.generate()
 
@@ -347,7 +348,8 @@ class Config:
                     "strategy",
                     "setenv",
                     "dot_dir",
-                    "extrasgroups",
+                    "extras",
+                    "groups",
                     "aliases",
                 ]
                 if param in section

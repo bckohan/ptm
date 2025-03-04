@@ -1,7 +1,7 @@
 import typing as t
 from pprint import pprint
 
-from typer import Context, Option, Typer, progressbar
+from typer import Context, Option, Typer
 from typing_extensions import Annotated
 
 from ..config import Config
@@ -21,10 +21,7 @@ def generate(
 ):
     cfg: Config = ctx.obj["config"]
     run_table = {}
-    with progressbar(
-        cfg.generate(environments=envs, tags=tags), label="Generating Runs"
-    ) as progress:
-        for run in progress:
-            run_table.setdefault(run.group.env.name, 0)
-            run_table[run.group.env.name] += 1
+    for run in cfg.generate(environments=envs, tags=tags):
+        run_table.setdefault(run.group.env.name, 0)
+        run_table[run.group.env.name] += 1
     pprint(run_table)

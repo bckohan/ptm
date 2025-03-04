@@ -1,0 +1,2 @@
+class GenerationFailed(Exception):
+    pass

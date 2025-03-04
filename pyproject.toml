@@ -77,7 +77,7 @@ skip_covered = true
 
 
 [tool.ptm]
-groups = ["dev", "django"]  # by default dev group is included in all environments, set to [] to exclude
+groups = ["test", "django"]  # by default dev group is included in all environments, set to [] to exclude
 extras = []
 
 [tool.ptm.setenv]
@@ -91,8 +91,8 @@ dj_main = "git+https://github.com/django/django.git@main#egg=Django"
 tags = []
 matrix = [
   # run exhaustive python/django version permutations in default env (sqlite)
-  {python = "3.8", django = "3.2", -strategy="lowest", -tags=["lowest"]},
-  {python = ["3.8", "3.9"], django = ["3.2", "4.0", "4.1", "4.2"]},
+  {python = "3.8.18", django = "3.2", -strategy="lowest-direct", -tags=["lowest"]},
+  {python = ["3.8.18", "3.9"], django = ["3.2", "4.0", "4.1", "4.2"]},
   {python = ["3.10"], django = ["3.2", "4.0", "4.1", "4.2", "5.0", "5.1", "5.2b1"]},
   {python = ["3.11"], django = ["4.1", "4.2", "5.0", "5.1", "5.2b1"]},
   {python = ["3.12"], django = ["4.2", "5.0", "5.1", "5.2b1"]},
@@ -104,11 +104,11 @@ matrix = [
 tags = []
 setenv = {RDBMS="postgres"}
 matrix = [
-  {python = ["3.8"],  django = ["3.2"], -groups=["psycopg2"], -strategy="lowest", -setenv={postgres="9.6"}, -tags=["lowest"]},
+  {python = ["3.8.18"],  django = ["3.2"], -groups=["psycopg2"], -strategy="lowest-direct", -setenv={postgres="9.6"}, -tags=["lowest"]},
   {python = ["3.10"], django = ["4.2"], psycopg2="2.9", -groups=["psycopg2"], -setenv={postgres="12"}},
   {python = ["3.10"], django = ["4.2"], psycopg="3.1", -groups=["psycopg3"], -setenv={postgres="13"}},
   {python = ["3.12"], django = ["5.1"], psycopg="3.2", -groups=["psycopg3"], -setenv={postgres="14"}},
-  {python = ["3.13"], django = ["5.21b"], -groups=["psycopg3"], -setenv={postgres="latest"}},  #, main
+  {python = ["3.13"], django = ["5.2b1"], -groups=["psycopg3"], -setenv={postgres="latest"}},  #, main
 ]
 
 # [tool.ptm.env]
@@ -120,8 +120,12 @@ dev = [
     "ipython>=8.12.3",
     "mypy>=1.14.1",
     "pre-commit>=3.5.0",
+    "pytest>=8.3.5",
     "ruff>=0.9.9",
     "types-requests>=2.32.0.20241016",
+]
+test = [
+    "pytest>=8.3.5",
 ]
 django = ["django>=3.2,<6.0"]
 docs = [
@@ -131,7 +135,7 @@ docs = [
     "sphinx>=7.1.2",
     "sphinxcontrib-typer>=0.2.1",
 ]
-psycopg2 = ["psycopg2>=2.5.4"] # for django > 3.2 needs 2.8.4
+psycopg2 = ["psycopg2>=2.7"] # for django > 3.2 needs 2.8.4
 psycopg3 = ["psycopg>=3.1.8"]  # django > 4.2
 
 [tool.doc8]
