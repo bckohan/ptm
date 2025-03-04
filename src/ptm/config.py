@@ -1,8 +1,12 @@
+import hashlib
+import itertools
 import os
 import shutil
 import typing as t
+import warnings
 from dataclasses import dataclass, field
 from enum import StrEnum
+from functools import cached_property
 from pathlib import Path
 
 import requests
@@ -11,11 +15,50 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import NormalizedName, canonicalize_name
 from packaging.version import InvalidVersion, parse
 from tomlkit.container import Container
-from tomlkit.items import Array, Item, String, Table
+from tomlkit.items import String, Table
 
-"""
-  {python = ["3.8"],  django = ["3.2"], groups=["psycopg2"], strategy="lowest", env={postgres="9.6"}},
-"""
+from . import __version__ as ptm_version
+
+
+class PTMDriver(t.Protocol):
+    def generate(self, run: "Run") -> Path:
+        """
+        Generate a file that will allow this driver to bootstrap a virtual environment
+        (e.g. requirements.txt) for this run later.
+        """
+        ...
+
+    def bootstrap(self, run: "Run"):
+        """
+        Install the virtual environment for the given run.
+        """
+        ...
+
+
+drivers: t.Dict[str, PTMDriver] = {}
+
+
+def register_driver(tool: str, driver: PTMDriver):
+    global drivers
+    drivers[tool] = driver
+
+
+def get_driver(tool: str) -> PTMDriver:
+    return drivers[tool]
+
+
+class DuplicateRunError(Exception):
+    id: str
+
+    def __init__(self, id: str):
+        self.id = id
+
+
+def hash_list(*strings: str) -> str:
+    hasher = hashlib.sha256()
+    for s in strings:
+        hasher.update(s.encode("utf-8"))
+    return hasher.hexdigest()
 
 
 class ResolutionStrategy(StrEnum):
@@ -61,28 +104,104 @@ class Dependency:
 
 @dataclass
 class Run:
-    env: "Environment"
     python: Dependency
-    strategy: t.Optional[ResolutionStrategy] = None
-    setenv: t.Dict[str, str] = field(default_factory=dict)
-    tags: t.List[str] = field(default_factory=list)
-    groups: t.List[str] = field(default_factory=list)
-    extras: t.List[str] = field(default_factory=list)
+    dependencies: t.List[Dependency]
+    group: "RunGroup"
 
-    # @property
-    # def strategy(self) -> t.Optional[ResolutionStrategy]:
-    #     return self.strategy or self.env.strategy
+    @cached_property
+    def name(self) -> str:
+        return ",".join(str(dep) for dep in (self.python, *self.dependencies))
+
+    def pformat(self) -> str:
+        return f"{self.name}\n\t{self.setenv=}\n\t{self.groups=}\n\t{self.extras=}"
+
+    @cached_property
+    def id(self) -> str:
+        return hash_list(
+            f"version={ptm_version}",  # invalidate the runs if the version is upgraded
+            f"strategy={self.strategy}",
+            "python=",
+            str(self.python),
+            "deps=",
+            *(str(dep) for dep in self.dependencies),
+            "env=",
+            *(f"{key}={val}" for key, val in self.setenv.items()),
+            "groups=",
+            *self.groups,
+            "extras=",
+            *self.extras,
+        )
+
+    def __post_init__(self):
+        if self.id in self.group.env.cfg.id_table:
+            raise DuplicateRunError(self.id)
+        for tag in self.tags:
+            self.group.env.cfg.tag_table.setdefault(tag, [])
+            self.group.env.cfg.tag_table[tag].append(self)
+
+    @property
+    def directory(self) -> Path:
+        return self.group.env.directory / self.id
+
+    @property
+    def strategy(self) -> t.Optional[ResolutionStrategy]:
+        return (
+            self.group.strategy
+            or self.group.env.strategy
+            or self.group.env.cfg.strategy
+        )
+
+    @property
+    def setenv(self) -> t.Dict[str, str]:
+        return {
+            **self.group.env.cfg.setenv,
+            **self.group.env.setenv,
+            **self.group.setenv,
+        }
+
+    @property
+    def tags(self) -> t.List[str]:
+        return list(set(*self.group.env.tags, *self.group.tags))
+
+    @property
+    def groups(self) -> t.List[str]:
+        return list(
+            set(
+                (*self.group.env.cfg.groups, *self.group.env.groups, *self.group.groups)
+            )
+        )
+
+    @property
+    def extras(self) -> t.List[str]:
+        return list(
+            set(
+                (*self.group.env.cfg.extras, *self.group.env.extras, *self.group.extras)
+            )
+        )
+
+    @property
+    def env_file(self) -> Path:
+        return self.directory / ".env"
+
+    def generate(self) -> "Run":
+        os.makedirs(self.directory, exist_ok=True)
+        self.env_file.write_text(
+            "\n".join(f'{key}="{val}"' for key, val in self.setenv.items())
+        )
+        self.group.env.cfg.driver.generate(self)
+        return self
 
 
 @dataclass
 class RunGroup:
     env: "Environment"
+    matrix: t.Dict[str, t.List[str]]
     strategy: t.Optional[ResolutionStrategy] = None
     setenv: t.Dict[str, str] = field(default_factory=dict)
     tags: t.List[str] = field(default_factory=list)
     groups: t.List[str] = field(default_factory=list)
     extras: t.List[str] = field(default_factory=list)
-    matrix: t.List[t.Dict[str, t.List[str]]] = field(default_factory=list)
+    lineno: t.Optional[int] = None
 
     runs: t.List[Run] = field(default_factory=list)
 
@@ -90,8 +209,58 @@ class RunGroup:
         self.expand()
 
     def expand(self) -> t.List[Run]:
-        # TODO
-        return []
+        assert "python" in self.matrix, (
+            "`ptm.env.matrix` entries must include `python`."
+        )
+        expanded = [
+            dict(zip(list(self.matrix.keys()), spec))
+            for spec in itertools.product(
+                *(
+                    [spec] if isinstance(spec, str) else spec
+                    for spec in self.matrix.values()
+                )
+            )
+        ]
+        for idx, run in enumerate(expanded):
+            try:
+                self.runs.append(
+                    Run(
+                        python=Dependency.parse(
+                            "python", self.env.cfg.resolve_alias(run["python"])
+                        ),
+                        dependencies=[
+                            Dependency.parse(pkg, self.env.cfg.resolve_alias(spec))
+                            for pkg, spec in run.items()
+                            if pkg != "python"
+                        ],
+                        group=self,
+                    )
+                )
+            except DuplicateRunError:
+                warnings.warn(f"Expanded run {idx} of ")
+        return self.runs
+
+    @staticmethod
+    def from_toml(env: "Environment", run_group: Table) -> "RunGroup":
+        return RunGroup(
+            env=env,
+            matrix={
+                dep: spec for dep, spec in run_group.items() if not dep.startswith("-")
+            },
+            **{
+                param.lstrip("-"): value
+                for param, value in run_group.items()
+                if param.startswith("-")
+            },
+        )
+
+    def generate(self, tags: t.Set[str] = {}) -> t.Generator[Run, None, None]:
+        for run in self.runs:
+            import ipdb
+
+            ipdb.set_trace()
+            if not tags or any((tag in tags for tag in run.tags)):
+                yield run.generate()
 
 
 @dataclass
@@ -109,20 +278,41 @@ class Environment:
     def directory(self) -> Path:
         return self.cfg.directory / self.name
 
-    def __post_init__(self):
-        pass
-
-    def generate(self) -> Path:
+    def generate(self, tags: t.Set[str] = {}) -> t.Generator[Run, None, None]:
         if self.directory.exists():
             shutil.rmtree(self.directory)
         os.makedirs(self.directory, exist_ok=True)
-        # groups = self.cfg.groups + self.groups
-        return self.directory
+        for grp in self.matrix:
+            yield from grp.generate(tags=tags)
+
+    @staticmethod
+    def from_toml(
+        name: str, cfg: "Config", env: t.Union[Container, Table, String]
+    ) -> "Environment":
+        if isinstance(env, String):
+            resp = requests.get(env)
+            resp.raise_for_status()
+            env = tomlkit.parse(resp.text)
+        parsed_env = Environment(
+            name=name,
+            cfg=cfg,
+            **{
+                param: env[param]
+                for param in ["strategy", "setenv", "tags", "groups", "extras"]
+                if param in env
+            },
+        )
+        parsed_env.matrix = [
+            RunGroup.from_toml(parsed_env, run) for run in env.get("matrix", [])
+        ]
+        return parsed_env
 
 
 @dataclass
 class Config:
     project_dir: Path
+    driver: PTMDriver = field(default_factory=lambda: get_driver("uv")())
+    strategy: t.Optional[ResolutionStrategy] = None
     setenv: t.Dict[str, str] = field(default_factory=dict)
     dot_dir: str = ".ptm"
     groups: t.List[str] = field(default_factory=lambda: ["dev"])
@@ -130,16 +320,64 @@ class Config:
     aliases: t.Dict[str, str] = field(default_factory=dict)
     environments: t.Dict[str, Environment] = field(default_factory=dict)
 
+    # maps tags to runs
+    tag_table: t.Dict[str, Run] = field(default_factory=dict)
+
+    id_table: t.Dict[str, Run] = field(default_factory=dict)
+
+    def resolve_alias(self, name: str) -> str:
+        return self.aliases.get(name, name)
+
     @property
     def directory(self) -> Path:
         return self.project_dir / self.dot_dir
 
+    @staticmethod
+    def from_toml(config_path: Path, doc: tomlkit.TOMLDocument) -> "Config":
+        section = doc["tool"]["ptm"]
+        assert isinstance(section, Table), "`tool.ptm` must be configured."
+        driver = {}
+        if "driver" in section:
+            driver["driver"] = get_driver(section["driver"])()
+        cfg = Config(
+            project_dir=config_path.parent,
+            **{
+                param: section[param]
+                for param in [
+                    "strategy",
+                    "setenv",
+                    "dot_dir",
+                    "extrasgroups",
+                    "aliases",
+                ]
+                if param in section
+            },
+            **driver,
+        )
+
+        assert "env" in section and isinstance(section["env"], dict), (
+            "`tool.ptm.env` must be configured correctly."
+        )
+        for env_name, env in t.cast(Table, section["env"]).items():
+            cfg.environments[env_name] = Environment.from_toml(env_name, cfg, env)
+        return cfg
+
+    def generate(
+        self, environments: t.Set[str] = {}, tags: t.Set[str] = {}
+    ) -> t.Generator[Run, None, None]:
+        for name, env in self.environments.items():
+            if not environments or name in environments:
+                yield from env.generate(tags=tags)
+
 
 def initialize(cfg_file: t.Optional[Path] = None) -> Config:
+    from .drivers.uv import UVDriver
+
+    register_driver("uv", UVDriver)
     config = cfg_file or find_config()
     if config is None or not config.exists():
         raise ValueError("No configuration file found.")
-    cfg = read_config(config)
+    cfg = Config.from_toml(config, tomlkit.parse(config.read_text()))
     os.makedirs(cfg.directory, exist_ok=True)
     return cfg
 
@@ -154,88 +392,3 @@ def find_config() -> t.Optional[Path]:
             return pyproj
         current_dir = current_dir.parent
     return None
-
-
-def _parse_run_group(env: Environment, run: Table) -> RunGroup:
-    return RunGroup(
-        env=env,
-        setenv=run.get("setenv", {}),
-        tags=run.get("tags", []),
-        groups=run.get("groups", []),
-        extras=run.get("extras", []),
-    )
-
-
-def _parse_env(
-    name: str, cfg: Config, env: t.Union[Container, Table, String]
-) -> Environment:
-    if isinstance(env, String):
-        resp = requests.get(_convert_to_native(env))
-        resp.raise_for_status()
-        env = tomlkit.parse(resp.text)
-    config_params = {
-        key
-        for key in Environment.__dataclass_fields__.keys()
-        if key not in ["name", "matrix"]
-    }
-    parsed_env = Environment(
-        name=name,
-        cfg=cfg,
-        **{key: _convert_to_native(env[key]) for key in config_params if key in env},
-    )
-    parsed_env.matrix = [
-        _parse_run_group(parsed_env, run) for run in env.get("matrix", [])
-    ]
-    return parsed_env
-
-
-def read_config(config: Path) -> Config:
-    # read the pyproject.toml file and return a Config object
-    # tool.uv.test_matrix
-    doc = tomlkit.parse(config.read_text())
-    section = read_section(doc, "tool.uv.test_matrix")
-    assert isinstance(section, Table), "`tool.uv.test.matrix` must be configured."
-    config_params = {
-        key for key in Config.__dataclass_fields__.keys() if key not in ["environments"]
-    }
-    cfg = Config(
-        project_dir=config.parent,
-        **{
-            key: _convert_to_native(section[key])
-            for key in config_params
-            if key in section
-        },
-    )
-    assert "env" in section and isinstance(section["env"], dict), (
-        "`tool.uv.test_matrix.env` must be configured correctly."
-    )
-    for env_name, env in t.cast(Table, section["env"]).items():
-        cfg.environments[env_name] = _parse_env(env_name, cfg, env)
-    return cfg
-
-
-def _convert_to_native(item: t.Union[Container, Table, Array, Item]) -> t.Any:
-    """Convert tomlkit objects to native Python types recursively."""
-    if isinstance(item, Table):
-        return {k: _convert_to_native(v) for k, v in item.items()}
-    elif isinstance(item, Array):
-        return [_convert_to_native(v) for v in item]
-    else:
-        return item.unwrap()
-
-
-def _is_container(obj: t.Any) -> bool:
-    return hasattr(obj, "__contains__") and hasattr(obj, "__getitem__")
-
-
-def read_section(
-    doc: t.Union[tomlkit.TOMLDocument, Table, Container], section: str
-) -> t.Optional[t.Union[Table, Item, Container]]:
-    parts = section.split(".")
-    current = doc
-    for part in parts:
-        if _is_container(current) and part in current:  # type: ignore
-            current = current[part]  # type: ignore
-        else:
-            return None
-    return current
