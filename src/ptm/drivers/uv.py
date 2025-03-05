@@ -67,7 +67,7 @@ class UVDriver:
             raise GenerationFailed(err.stderr) from err
 
     @contextmanager
-    def bootstrap(self, run: Run, revert: bool = True):
+    def bootstrap(self, run: Run):
         """
         Set up anything required before generating.
         """
@@ -76,13 +76,16 @@ class UVDriver:
             requirements = run.directory / "requirements.txt"
             if not requirements.is_file() or not requirements.stat().st_size:
                 self.generate(run)
+            subprocess.run(
+                ["uv", "venv", "--python", run.python, str(run.venv)], check=True
+            )
             yield subprocess.run(
                 [
                     "uv",
                     "pip",
                     "install",
                     "--python",
-                    run.python,
+                    run.python_path,
                     "--exact",
                     "-r",
                     str(requirements),
@@ -90,5 +93,4 @@ class UVDriver:
                 check=True,
             )
         finally:
-            if revert and self.DEFAULT_ENVIRONMENT:
-                subprocess.run(self.DEFAULT_ENVIRONMENT.split(), check=False)
+            pass

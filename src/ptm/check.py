@@ -1,7 +1,9 @@
 import os
 import sys
 from importlib.metadata import version as pkg_version
+from pathlib import Path
 
+from dotenv import dotenv_values
 from packaging.requirements import Requirement
 
 
@@ -14,8 +16,12 @@ def validate_environment():
     )
     for req in os.environ["PTM_CONSTRAINTS"].split(";"):
         req = Requirement(req)
-        assert pkg_version(req.name) in req.specifier, (
-            f"Unexpected package version {req} != {pkg_version(req.name)}"
-        )
+        if req.specifier:
+            assert pkg_version(req.name) in req.specifier, (
+                f"Unexpected package version {req} != {pkg_version(req.name)}"
+            )
 
-    # todo check environment
+    for key, value in dotenv_values(Path(os.environ["PTM_RUN"]) / ".env").items():
+        assert os.environ.get(key, None) == value, (
+            f"{key}: {os.environ.get(key, None)}!={value}"
+        )

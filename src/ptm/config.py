@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import cached_property
 from pathlib import Path
+from platform import platform
 
 import requests
 import tomlkit
@@ -37,7 +38,7 @@ class PTMDriver(t.Protocol):
         ...
 
     @contextmanager
-    def bootstrap(self, run: "Run", revert: bool = True):
+    def bootstrap(self, run: "Run"):
         """
         Install the virtual environment for the given run.
         """
@@ -159,26 +160,35 @@ class Run:
         # todo - optimize this - can't use frozen dataclass hashes because string types
         # hashes are randomly seeded on each start, so the hashes will not be the same
         # TODO sometimes this is not repeatable!!!
-        return hash_list(
-            f"version={ptm_version}",  # invalidate the runs if the version is upgraded
-            f"strategy={self.strategy}",
-            "python=",
-            str(self.python),
-            "deps=",
-            *[str(dep) for dep in self.dependencies],
-            "env=",
-            *[
-                f"{key}={val}"
-                for key, val in self.setenv.items()
-                if not key.startswith("PTM_")
-            ],
-            "groups=",
-            *self.groups,
-            "extras=",
-            *self.extras,
-            "markers=",
-            *[str(marker) for marker in self.markers],
-        )[:ID_LENGTH]
+        signifiers = [
+            ptm_version,
+            f"python={self.python}",
+            ";".join(str(dep) for dep in self.dependencies),
+        ]
+        if self.strategy:
+            signifiers.append(f"strategy={self.strategy}")
+        if self.setenv:
+            signifiers.append(
+                ";".join(
+                    sorted(
+                        [
+                            f"{key}={val}"
+                            for key, val in self.setenv.items()
+                            if not key.startswith("PTM_")
+                        ]
+                    )
+                )
+            )
+        if self.groups:
+            signifiers.append("_groups")
+            signifiers.extend(sorted(self.groups))
+        if self.extras:
+            signifiers.append("_extras")
+            signifiers.extend(sorted(self.extras))
+        if self.markers:
+            signifiers.append("_markers")
+            signifiers.extend(sorted([str(marker) for marker in self.markers]))
+        return hash_list(*signifiers)[:ID_LENGTH]
 
     def __post_init__(self):
         if self.ident in self.group.env.cfg.id_table:
@@ -190,7 +200,12 @@ class Run:
 
     @property
     def slug(self) -> str:
-        return f"{self.group.env.name}: python={self.python}; {';'.join(str(dep) for dep in self.dependencies)}"
+        strategy = f" ({self.strategy})" if self.strategy else " "
+        return (
+            f"{self.group.env.name}: "
+            f"python={self.python}; "
+            f"{';'.join(str(dep) for dep in self.dependencies)}{strategy}"
+        )
 
     @property
     def directory(self) -> Path:
@@ -239,12 +254,22 @@ class Run:
     def env_file(self) -> Path:
         return self.directory / ".env"
 
+    @property
+    def venv(self) -> Path:
+        return self.directory / ".venv"
+
+    @property
+    def python_path(self) -> Path:
+        if platform() == "Windows":
+            return self.venv / "Scripts" / "python"
+        return self.venv / "bin" / "python"
+
     def generate(self) -> "Run":
         os.makedirs(self.directory, exist_ok=True)
         self.env_file.write_text(
             "\n".join(
                 f'{key}="{val}"'
-                for key, val in {**self.setenv, "PTM_RUN": self.ident}.items()
+                for key, val in {**self.setenv, "PTM_RUN": self.directory}.items()
             )
         )
         try:
@@ -260,14 +285,20 @@ class Run:
             self.generate()
         current = dict(os.environ.copy())
         run_env = {**current, **dotenv_values(self.env_file)}
-        with self.group.env.cfg.driver.bootstrap(self, revert=revert):
+        with self.group.env.cfg.driver.bootstrap(self):
             try:
+                for key, value in run_env.items():
+                    if value is not None:
+                        os.environ[key] = value
+                os.environ["PATH"] = (
+                    f"{self.python_path.parent}:{os.environ.get('PATH', '')}"
+                )
                 yield
             finally:
                 for key in run_env:
                     if key in current:
                         os.environ[key] = current[key]
-                    else:
+                    elif key in os.environ:
                         del os.environ[key]
 
 
@@ -339,7 +370,8 @@ class RunGroup:
     def generate(self, tags: t.Set[str] = set()) -> t.Generator[Run, None, None]:
         for run in self.runs:
             if not tags or any((tag in tags for tag in run.tags)):
-                yield run.generate()
+                if run.evaluate_markers():
+                    yield run.generate()
 
 
 @dataclass
@@ -364,6 +396,13 @@ class Environment:
         os.makedirs(self.directory, exist_ok=True)
         for grp in self.matrix:
             yield from grp.generate(tags=tags)
+
+    def runs(self, tags: t.Set[str] = set()) -> t.Generator[Run, None, None]:
+        for group in self.matrix:
+            for run in group.runs:
+                if not tags or any((tag in tags for tag in run.tags)):
+                    if run.evaluate_markers():
+                        yield run
 
     @staticmethod
     def from_toml(
@@ -453,6 +492,13 @@ class Config:
         for name, env in self.environments.items():
             if not environments or name in environments:
                 yield from env.generate(tags=tags)
+
+    def runs(
+        self, environments: t.Set[str] = set(), tags: t.Set[str] = set()
+    ) -> t.Generator[Run, None, None]:
+        for name, env in self.environments.items():
+            if not environments or name in environments:
+                yield from env.runs(tags=tags)
 
 
 def initialize(cfg_file: t.Optional[Path] = None) -> Config:
