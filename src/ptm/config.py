@@ -5,13 +5,17 @@ import shutil
 import sys
 import typing as t
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum
 from functools import cached_property
 from pathlib import Path
 
 import requests
 import tomlkit
+from dotenv import dotenv_values
+from packaging.markers import Marker
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import NormalizedName, canonicalize_name
 from packaging.version import InvalidVersion, parse
@@ -21,16 +25,19 @@ from tomlkit.items import String, Table
 from . import __version__ as ptm_version
 from .drivers import GenerationFailed
 
+ID_LENGTH = 12
+
 
 class PTMDriver(t.Protocol):
-    def generate(self, run: "Run") -> Path:
+    def generate(self, run: "Run"):
         """
         Generate a file that will allow this driver to bootstrap a virtual environment
         (e.g. requirements.txt) for this run later.
         """
         ...
 
-    def bootstrap(self, run: "Run"):
+    @contextmanager
+    def bootstrap(self, run: "Run", revert: bool = True):
         """
         Install the virtual environment for the given run.
         """
@@ -50,10 +57,10 @@ def get_driver(tool: str) -> PTMDriver:
 
 
 class DuplicateRunError(Exception):
-    id: str
+    ident: str
 
-    def __init__(self, id: str):
-        self.id = id
+    def __init__(self, ident: str):
+        self.ident = ident
 
 
 def hash_list(*strings: str) -> str:
@@ -63,19 +70,29 @@ def hash_list(*strings: str) -> str:
     return hasher.hexdigest()
 
 
-class ResolutionStrategy(StrEnum):
+class ResolutionStrategy(str, Enum):
     HIGHEST = "highest"
     LOWEST = "lowest"
     LOWEST_DIRECT = "lowest-direct"
 
+    def __str__(self):
+        return str(self.value)
+
 
 @dataclass
 class Dependency:
-    package: NormalizedName
-    specifier: SpecifierSet
+    requirement: Requirement
+
+    @cached_property
+    def package(self) -> NormalizedName:
+        return canonicalize_name(self.requirement.name)
+
+    @property
+    def specifier(self) -> SpecifierSet:
+        return self.requirement.specifier
 
     def __str__(self) -> str:
-        return f"{self.package}{self.specifier}"
+        return str(self.requirement)
 
     @staticmethod
     def parse(package: str, dep: str) -> "Dependency":
@@ -100,8 +117,15 @@ class Dependency:
                 else:
                     specifier = SpecifierSet(f"=={dep}")
             except InvalidVersion:
-                raise ValueError(f"Invalid dependency specifier: {package}={dep}")
-        return Dependency(package=package, specifier=specifier)
+                try:
+                    # maybe we have a url
+                    return Dependency(Requirement(f"{package} @ {dep}"))
+                except InvalidRequirement as ivr:
+                    raise ValueError(
+                        f"Invalid dependency specifier: {package}={dep}"
+                    ) from ivr
+
+        return Dependency(Requirement(f"{package}{specifier}"))
 
 
 @dataclass
@@ -109,41 +133,68 @@ class Run:
     python: str
     dependencies: t.List[Dependency]
     group: "RunGroup"
+    markers: t.List[Marker] = field(default_factory=list)
+
+    def __str__(self):
+        return f"[{self.ident}] {self.slug}"
+
+    def __repr__(self):
+        return str(self)
 
     @cached_property
     def name(self) -> str:
         return ",".join(str(dep) for dep in (self.python, *self.dependencies))
 
-    def pformat(self) -> str:
-        return f"{self.name}\n\t{self.setenv=}\n\t{self.groups=}\n\t{self.extras=}"
+    def evaluate_markers(self) -> bool:
+        """
+        Validate that the current environment satisifies the given markers.
+        """
+        for marker in self.markers:
+            if not marker.evaluate():
+                return False
+        return True
 
     @cached_property
-    def id(self) -> str:
+    def ident(self) -> str:
+        # todo - optimize this - can't use frozen dataclass hashes because string types
+        # hashes are randomly seeded on each start, so the hashes will not be the same
+        # TODO sometimes this is not repeatable!!!
         return hash_list(
             f"version={ptm_version}",  # invalidate the runs if the version is upgraded
             f"strategy={self.strategy}",
             "python=",
             str(self.python),
             "deps=",
-            *(str(dep) for dep in self.dependencies),
+            *[str(dep) for dep in self.dependencies],
             "env=",
-            *(f"{key}={val}" for key, val in self.setenv.items()),
+            *[
+                f"{key}={val}"
+                for key, val in self.setenv.items()
+                if not key.startswith("PTM_")
+            ],
             "groups=",
             *self.groups,
             "extras=",
             *self.extras,
-        )
+            "markers=",
+            *[str(marker) for marker in self.markers],
+        )[:ID_LENGTH]
 
     def __post_init__(self):
-        if self.id in self.group.env.cfg.id_table:
-            raise DuplicateRunError(self.id)
+        if self.ident in self.group.env.cfg.id_table:
+            raise DuplicateRunError(self.ident)
+        self.group.env.cfg.id_table[self.ident] = self
         for tag in self.tags:
             self.group.env.cfg.tag_table.setdefault(tag, [])
             self.group.env.cfg.tag_table[tag].append(self)
 
     @property
+    def slug(self) -> str:
+        return f"{self.group.env.name}: python={self.python}; {';'.join(str(dep) for dep in self.dependencies)}"
+
+    @property
     def directory(self) -> Path:
-        return self.group.env.directory / self.id
+        return self.group.env.directory / self.ident
 
     @property
     def strategy(self) -> t.Optional[ResolutionStrategy]:
@@ -159,6 +210,9 @@ class Run:
             **self.group.env.cfg.setenv,
             **self.group.env.setenv,
             **self.group.setenv,
+            "PTM_ENV": self.group.env.name,
+            "PTM_PYTHON": self.python,
+            "PTM_CONSTRAINTS": ";".join([str(dep) for dep in self.dependencies]),
         }
 
     @property
@@ -188,7 +242,10 @@ class Run:
     def generate(self) -> "Run":
         os.makedirs(self.directory, exist_ok=True)
         self.env_file.write_text(
-            "\n".join(f'{key}="{val}"' for key, val in self.setenv.items())
+            "\n".join(
+                f'{key}="{val}"'
+                for key, val in {**self.setenv, "PTM_RUN": self.ident}.items()
+            )
         )
         try:
             self.group.env.cfg.driver.generate(self)
@@ -196,6 +253,22 @@ class Run:
             print(gf)
             sys.exit(1)
         return self
+
+    @contextmanager
+    def bootstrap(self, revert: bool = True):
+        if not self.env_file.is_file():
+            self.generate()
+        current = dict(os.environ.copy())
+        run_env = {**current, **dotenv_values(self.env_file)}
+        with self.group.env.cfg.driver.bootstrap(self, revert=revert):
+            try:
+                yield
+            finally:
+                for key in run_env:
+                    if key in current:
+                        os.environ[key] = current[key]
+                    else:
+                        del os.environ[key]
 
 
 @dataclass
@@ -207,6 +280,7 @@ class RunGroup:
     tags: t.List[str] = field(default_factory=list)
     groups: t.List[str] = field(default_factory=list)
     extras: t.List[str] = field(default_factory=list)
+    markers: t.List[Marker] = field(default_factory=list)
     lineno: t.Optional[int] = None
 
     runs: t.List[Run] = field(default_factory=list)
@@ -222,7 +296,7 @@ class RunGroup:
             dict(zip(list(self.matrix.keys()), spec))
             for spec in itertools.product(
                 *(
-                    [spec] if isinstance(spec, str) else spec
+                    [spec] if isinstance(spec, str) else spec  # type: ignore
                     for spec in self.matrix.values()
                 )
             )
@@ -231,7 +305,7 @@ class RunGroup:
             try:
                 self.runs.append(
                     Run(
-                        python=self.env.cfg.resolve_alias(run["python"]),
+                        python=run["python"],
                         dependencies=[
                             Dependency.parse(pkg, self.env.cfg.resolve_alias(spec))
                             for pkg, spec in run.items()
@@ -240,8 +314,11 @@ class RunGroup:
                         group=self,
                     )
                 )
-            except DuplicateRunError:
-                warnings.warn(f"Expanded run {idx} of ")
+            except DuplicateRunError as dre:
+                warnings.warn(
+                    f"Run {dre.ident} in {self.env.name} has a duplicate in "
+                    f"{self.env.cfg.id_table[dre.ident].name}."
+                )
         return self.runs
 
     @staticmethod
@@ -254,11 +331,12 @@ class RunGroup:
             **{
                 param.lstrip("-"): value
                 for param, value in run_group.items()
-                if param.startswith("-")
+                if param.startswith("-") and param != "-markers"
             },
+            markers=[Marker(marker) for marker in run_group.get("-markers", [])],
         )
 
-    def generate(self, tags: t.Set[str] = {}) -> t.Generator[Run, None, None]:
+    def generate(self, tags: t.Set[str] = set()) -> t.Generator[Run, None, None]:
         for run in self.runs:
             if not tags or any((tag in tags for tag in run.tags)):
                 yield run.generate()
@@ -273,13 +351,14 @@ class Environment:
     tags: t.List[str] = field(default_factory=list)
     groups: t.List[str] = field(default_factory=list)
     extras: t.List[str] = field(default_factory=list)
+    markers: t.List[Marker] = field(default_factory=list)
     matrix: t.List[RunGroup] = field(default_factory=list)
 
     @property
     def directory(self) -> Path:
         return self.cfg.directory / self.name
 
-    def generate(self, tags: t.Set[str] = {}) -> t.Generator[Run, None, None]:
+    def generate(self, tags: t.Set[str] = set()) -> t.Generator[Run, None, None]:
         if self.directory.exists():
             shutil.rmtree(self.directory)
         os.makedirs(self.directory, exist_ok=True)
@@ -297,7 +376,8 @@ class Environment:
         parsed_env = Environment(
             name=name,
             cfg=cfg,
-            **{
+            markers=[Marker(marker) for marker in env.get("markers", [])],
+            **{  # type: ignore
                 param: env[param]
                 for param in ["strategy", "setenv", "tags", "groups", "extras"]
                 if param in env
@@ -312,7 +392,7 @@ class Environment:
 @dataclass
 class Config:
     project_dir: Path
-    driver: PTMDriver = field(default_factory=lambda: get_driver("uv")())
+    driver: PTMDriver = field(default_factory=lambda: get_driver("uv"))
     strategy: t.Optional[ResolutionStrategy] = None
     setenv: t.Dict[str, str] = field(default_factory=dict)
     dot_dir: str = ".ptm"
@@ -335,14 +415,17 @@ class Config:
 
     @staticmethod
     def from_toml(config_path: Path, doc: tomlkit.TOMLDocument) -> "Config":
-        section = doc["tool"]["ptm"]
-        assert isinstance(section, Table), "`tool.ptm` must be configured."
+        tool = doc.get("tool", None)
+        assert tool and isinstance(tool, dict), "`tool.ptm` must be configured."
+        section = tool["ptm"]
+        assert isinstance(section, dict), "`tool.ptm` must be configured."
         driver = {}
         if "driver" in section:
-            driver["driver"] = get_driver(section["driver"])()
+            assert isinstance(section["driver"], str)
+            driver["driver"] = get_driver(section["driver"])
         cfg = Config(
             project_dir=config_path.parent,
-            **{
+            **{  # type: ignore
                 param: section[param]
                 for param in [
                     "strategy",
@@ -354,7 +437,7 @@ class Config:
                 ]
                 if param in section
             },
-            **driver,
+            **driver,  # type: ignore
         )
 
         assert "env" in section and isinstance(section["env"], dict), (
@@ -365,7 +448,7 @@ class Config:
         return cfg
 
     def generate(
-        self, environments: t.Set[str] = {}, tags: t.Set[str] = {}
+        self, environments: t.Set[str] = set(), tags: t.Set[str] = set()
     ) -> t.Generator[Run, None, None]:
         for name, env in self.environments.items():
             if not environments or name in environments:
@@ -375,7 +458,7 @@ class Config:
 def initialize(cfg_file: t.Optional[Path] = None) -> Config:
     from .drivers.uv import UVDriver
 
-    register_driver("uv", UVDriver)
+    register_driver("uv", UVDriver())
     config = cfg_file or find_config()
     if config is None or not config.exists():
         raise ValueError("No configuration file found.")

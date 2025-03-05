@@ -20,8 +20,8 @@ def generate(
     ] = [],
 ):
     cfg: Config = ctx.obj["config"]
-    run_table = {}
-    for run in cfg.generate(environments=envs, tags=tags):
+    run_table: t.Dict[str, int] = {}
+    for run in cfg.generate(environments=set(envs), tags=set(tags)):
         run_table.setdefault(run.group.env.name, 0)
         run_table[run.group.env.name] += 1
     pprint(run_table)

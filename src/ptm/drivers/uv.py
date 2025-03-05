@@ -1,14 +1,16 @@
 import os
 import subprocess
+from contextlib import contextmanager
 from itertools import chain
-from pathlib import Path
 
 from ..config import Run
 from . import GenerationFailed
 
 
 class UVDriver:
-    def generate(self, run: Run) -> Path:
+    DEFAULT_ENVIRONMENT = os.environ.get("PTM_DEFAULT_ENV", "uv sync")
+
+    def generate(self, run: Run):
         """Generate some output based on input data."""
         req_file = run.directory / "requirements.in"
         resolution = ["--resolution", run.strategy] if run.strategy else []
@@ -64,6 +66,29 @@ class UVDriver:
             print(run.directory)
             raise GenerationFailed(err.stderr) from err
 
-    def bootstrap(self) -> None:
-        """Set up anything required before generating."""
+    @contextmanager
+    def bootstrap(self, run: Run, revert: bool = True):
+        """
+        Set up anything required before generating.
+        """
         "uv pip install --exact"
+        try:
+            requirements = run.directory / "requirements.txt"
+            if not requirements.is_file() or not requirements.stat().st_size:
+                self.generate(run)
+            yield subprocess.run(
+                [
+                    "uv",
+                    "pip",
+                    "install",
+                    "--python",
+                    run.python,
+                    "--exact",
+                    "-r",
+                    str(requirements),
+                ],
+                check=True,
+            )
+        finally:
+            if revert and self.DEFAULT_ENVIRONMENT:
+                subprocess.run(self.DEFAULT_ENVIRONMENT.split(), check=False)

@@ -3,11 +3,14 @@ A portable test environment matrix generator for python packages.
 
 The goal of PTM is to as simply as possible:
 
-0. Use project's package manager directly for virtual environment management.
+0. Use project's package manager directly for virtual environment management (uv by default).
 1. Specify testing dependency environments in pyproject.toml
 2. Define environments by:
     * python versions
     * dependency versions
+    * extras
+    * groups
+    * markers
     * environment variables
     * version solving strategy (e.g. lowest vs highest)
     * tags
@@ -20,6 +23,5 @@ The goal of PTM is to as simply as possible:
     - Dynamic dependency ranges
 
 **PTM is not a test runner it is an environment definer, visualizer and bootstrapper.**
-
 
 *visualization idea: 2D: version x package matrix, heatmapped with shading based on number of runs version appears in, and when a version is hovered over the versions of other packages that are tested in combo are highlighted*

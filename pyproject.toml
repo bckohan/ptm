@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ptm"
 version = "0.1.0"
-description = "A portable test environment matrix generator for python packages."
+description = "A portable test environment matrix generator/visualizer for python packages."
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [
@@ -13,7 +13,7 @@ authors = [
 ]
 dependencies = [
     "packaging>=24.2",
-    "python-dotenv>=1.0.1",
+    "python-dotenv[cli]>=1.0.1",
     "requests>=2.32.3",
     "tomlkit>=0.13.2",
     "typer>=0.15.2",
@@ -97,7 +97,7 @@ matrix = [
   {python = ["3.11"], django = ["4.1", "4.2", "5.0", "5.1", "5.2b1"]},
   {python = ["3.12"], django = ["4.2", "5.0", "5.1", "5.2b1"]},
   {python = ["3.13"], django = ["5.1", "5.2b1"]},
-  #{python = ["3.13"], django = "dj_main"},
+  {python = ["3.13"], django = "dj_main"},
 ]
 
 [tool.ptm.env.postgres]
@@ -108,7 +108,7 @@ matrix = [
   {python = ["3.10"], django = ["4.2"], psycopg2="2.9", -groups=["psycopg2"], -setenv={postgres="12"}},
   {python = ["3.10"], django = ["4.2"], psycopg="3.1", -groups=["psycopg3"], -setenv={postgres="13"}},
   {python = ["3.12"], django = ["5.1"], psycopg="3.2", -groups=["psycopg3"], -setenv={postgres="14"}},
-  {python = ["3.13"], django = ["5.2b1"], -groups=["psycopg3"], -setenv={postgres="latest"}},  #, main
+  {python = ["3.13"], django = ["5.2b1", "dj_main"], -groups=["psycopg3"], -setenv={postgres="latest"}},
 ]
 
 # [tool.ptm.env]
@@ -149,7 +149,6 @@ exclude = [
     "doc",
     "dist",
     "examples",
-    "plot_benchmarks.py"
 ]
 
 [tool.ruff.lint]
